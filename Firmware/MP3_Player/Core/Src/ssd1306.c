@@ -1,22 +1,28 @@
+/**
+  ******************************************************************************
+  * @file    ssd1306.c
+  * @author  polcf03
+  * @brief   Implementación del driver y motor gráfico 2D para SSD1306 vía I2C.
+  ******************************************************************************
+  */
+
 #include "ssd1306.h"
 
 /* ----------------------------------------------------------------------------
  * VARIABLES PRIVADAS Y MEMORIA RAM (FRAMEBUFFER)
  * ---------------------------------------------------------------------------- */
 
-/* Framebuffer: Matriz en la RAM del STM32 que almacena la imagen de la pantalla.
- * Tamaño: (128 píxeles de ancho * 64 píxeles de alto) / 8 bits por byte = 1024 Bytes (1 KB).
- * "static" limita su visibilidad exclusivamente a este archivo .c */
-static uint8_t SSD1306_Buffer[128 * 64 / 8];
+/* Framebuffer: Matriz en RAM del microcontrolador que almacena la imagen completa.
+ * Tamaño: (128 píxeles de ancho * 64 píxeles de alto) / 8 bits = 1024 Bytes (1 KB). */
+static uint8_t SSD1306_Buffer[SSD1306_WIDTH * SSD1306_HEIGHT / 8];
 
-/* Estructura para almacenar el estado del cursor y de inicialización */
+/* Estructura para el seguimiento de la posición del cursor de texto */
 typedef struct {
-    uint16_t CurrentX;   /* Posición actual del cursor en el eje X (0-127) */
-    uint16_t CurrentY;   /* Posición actual del cursor en el eje Y (0-63) */
-    uint8_t Initialized; /* Bandera que indica si la pantalla ya fue inicializada (1) o no (0) */
+    uint16_t CurrentX;
+    uint16_t CurrentY;
+    uint8_t  Initialized;
 } SSD1306_t;
 
-/* Instancia de la estructura de control de estado */
 static SSD1306_t SSD1306;
 
 /* ----------------------------------------------------------------------------
@@ -24,66 +30,57 @@ static SSD1306_t SSD1306;
  * ---------------------------------------------------------------------------- */
 
 /**
-  * @brief  Envía un byte de comando al controlador SSD1306.
-  * @param  command: Byte de comando a transmitir (ej. 0xAF para encender pantalla).
-  * @retval Ninguno.
-  */
+ * @brief  Envía un byte de comando de configuración al controlador SSD1306.
+ * @param  command: Código de comando (ej. 0xAF para encender el panel).
+ */
 static void ssd1306_WriteCommand(uint8_t command) {
-    /* HAL_I2C_Mem_Write argumentos:
-     * 1. &SSD1306_I2C_PORT: Puntero al periférico I2C (hi2c1).
-     * 2. SSD1306_I2C_ADDR: Dirección I2C del chip (0x78).
-     * 3. 0x00: "Control Byte" -> Le indica a la pantalla que el byte siguiente es un COMANDO.
-     * 4. 1: Tamaño de la dirección de memoria interna (1 Byte).
-     * 5. &command: Puntero al byte del comando a enviar.
-     * 6. 1: Cantidad de bytes a transmitir.
-     * 7. 100: Tiempo de espera máximo (timeout en milisegundos). */
+    /* El byte de control 0x00 le indica al SSD1306 que el byte entrante es un comando */
     HAL_I2C_Mem_Write(&SSD1306_I2C_PORT, SSD1306_I2C_ADDR, 0x00, 1, &command, 1, 100);
 }
 
 /* ----------------------------------------------------------------------------
- * FUNCIONES PÚBLICAS DE DIBUJO Y CONTROL
+ * FUNCIONES PÚBLICAS DE GESTIÓN Y CONTROL
  * ---------------------------------------------------------------------------- */
 
 /**
-  * @brief  Inicializa el controlador de la pantalla OLED mediante la secuencia
-  *         de comandos requerida por el fabricante.
-  * @retval uint8_t: Retorna 1 al finalizar correctamente.
-  */
+ * @brief  Inicializa el display según la secuencia oficial de arranque de Solomon Systech.
+ * @retval 1 al completar con éxito.
+ */
 uint8_t ssd1306_Init(void) {
-    /* Pequeño retardo inicial para asegurar estabilidad de voltaje en la pantalla */
+    /* Pausa para estabilizar la alimentación del panel */
     HAL_Delay(100);
 
-    /* Secuencia de comandos de inicialización del chip SSD1306 */
-    ssd1306_WriteCommand(0xAE); // Display OFF (Apaga la pantalla durante la configuración)
-    ssd1306_WriteCommand(0x20); // Establece el modo de direccionamiento de memoria
-    ssd1306_WriteCommand(0x10); // Modo de direccionamiento de página
-    ssd1306_WriteCommand(0xB0); // Establece la página de inicio para la memoria GDDRAM en 0
-    ssd1306_WriteCommand(0xC8); // Escaneo de salida COM remapeado (orientación vertical)
-    ssd1306_WriteCommand(0x00); // Establece la dirección de columna inicial (parte baja)
-    ssd1306_WriteCommand(0x10); // Establece la dirección de columna inicial (parte alta)
-    ssd1306_WriteCommand(0x40); // Establece la línea de inicio de pantalla a 0
-    ssd1306_WriteCommand(0x81); // Configuración del contraste de la pantalla
-    ssd1306_WriteCommand(0xFF); // Valor de contraste máximo (0x00 a 0xFF)
-    ssd1306_WriteCommand(0xA1); // Establece el remapeo de columnas/segmentos (orientación horizontal)
-    ssd1306_WriteCommand(0xA6); // Display Normal (píxeles encendidos = blanco, no invertido)
-    ssd1306_WriteCommand(0xA8); // Configuración del Multiplex Ratio
-    ssd1306_WriteCommand(0x3F); // Duty ratio de 1/64 (para pantallas de 64 píxeles de alto)
-    ssd1306_WriteCommand(0xA4); // Sigue el contenido de la memoria RAM (Output follows RAM)
-    ssd1306_WriteCommand(0xD3); // Configura el desplazamiento de pantalla (Display Offset)
-    ssd1306_WriteCommand(0x00); // Sin desplazamiento (0x00)
-    ssd1306_WriteCommand(0xD5); // Configura la frecuencia del oscilador/divisor de reloj
-    ssd1306_WriteCommand(0xF0); // Ratio máximo
-    ssd1306_WriteCommand(0xD9); // Configuración del periodo de Pre-carga
-    ssd1306_WriteCommand(0x22); // Periodo recomendado
-    ssd1306_WriteCommand(0xDA); // Configuración de pines COM del hardware
-    ssd1306_WriteCommand(0x12); // Configuración alternativa para resolución 128x64
-    ssd1306_WriteCommand(0xDB); // Configura el nivel de deselección VCOMH
-    ssd1306_WriteCommand(0x20); // 0.77 * Vcc
-    ssd1306_WriteCommand(0x8D); // Habilita el elevador de voltaje interno (Charge Pump)
-    ssd1306_WriteCommand(0x14); // Genera los 7V-9V necesarios desde los 3.3V de entrada
-    ssd1306_WriteCommand(0xAF); // Display ON (Enciende la pantalla finalmente)
+    /* Secuencia de comandos de inicialización */
+    ssd1306_WriteCommand(0xAE); // Display OFF (Apagar panel durante configuración)
+    ssd1306_WriteCommand(0x20); // Set Memory Addressing Mode
+    ssd1306_WriteCommand(0x10); // 0x10 = Page Addressing Mode
+    ssd1306_WriteCommand(0xB0); // Set Page Start Address para GDDRAM en 0
+    ssd1306_WriteCommand(0xC8); // COM Output Scan Direction (Remapeado vertical)
+    ssd1306_WriteCommand(0x00); // Set Low Column Address
+    ssd1306_WriteCommand(0x10); // Set High Column Address
+    ssd1306_WriteCommand(0x40); // Set Start Line Address a 0
+    ssd1306_WriteCommand(0x81); // Set Contrast Control
+    ssd1306_WriteCommand(0xFF); // Contraste máximo (0x00 a 0xFF)
+    ssd1306_WriteCommand(0xA1); // Set Segment Re-map (Remapeado horizontal)
+    ssd1306_WriteCommand(0xA6); // Normal Display (1 = Píxel encendido, 0 = Píxel apagado)
+    ssd1306_WriteCommand(0xA8); // Set Multiplex Ratio
+    ssd1306_WriteCommand(0x3F); // 1/64 duty (para pantalla de 64 píxeles de alto)
+    ssd1306_WriteCommand(0xA4); // Output follows RAM (Seguir contenido de memoria)
+    ssd1306_WriteCommand(0xD3); // Set Display Offset
+    ssd1306_WriteCommand(0x00); // Sin desplazamiento
+    ssd1306_WriteCommand(0xD5); // Set Display Clock Divide Ratio / Oscillator Frequency
+    ssd1306_WriteCommand(0xF0); // Frecuencia máxima recomendada
+    ssd1306_WriteCommand(0xD9); // Set Pre-charge Period
+    ssd1306_WriteCommand(0x22); // Periodo estándar recomendado
+    ssd1306_WriteCommand(0xDA); // Set COM Pins Hardware Configuration
+    ssd1306_WriteCommand(0x12); // Configuración alternativa para paneles de 128x64
+    ssd1306_WriteCommand(0xDB); // Set VCOMH Deselect Level
+    ssd1306_WriteCommand(0x20); // ~0.77 x Vcc
+    ssd1306_WriteCommand(0x8D); // Charge Pump Setting
+    ssd1306_WriteCommand(0x14); // Enable Charge Pump (Eleva 3.3V a los 7-9V necesarios)
+    ssd1306_WriteCommand(0xAF); // Display ON (Encender panel)
 
-    /* Limpia el buffer local de RAM y reinicia las coordenadas del cursor */
+    /* Limpiar memoria interna y reiniciar cursor */
     ssd1306_Fill(Black);
     SSD1306.CurrentX = 0;
     SSD1306.CurrentY = 0;
@@ -93,92 +90,128 @@ uint8_t ssd1306_Init(void) {
 }
 
 /**
-  * @brief  Rellena todo el buffer con el color indicado (Black o White).
-  * @param  color: Color a pintar (Black = 0x00, White = 0xFF).
-  * @retval Ninguno.
-  */
+ * @brief  Pinta todo el Framebuffer con un único color.
+ */
 void ssd1306_Fill(SSD1306_COLOR color) {
-    /* Si el color es Black pone los bytes a 0x00, si es White pone los bytes a 0xFF */
     uint8_t fill_val = (color == Black) ? 0x00 : 0xFF;
-
-    for(uint16_t i = 0; i < sizeof(SSD1306_Buffer); i++) {
+    for (uint32_t i = 0; i < sizeof(SSD1306_Buffer); i++) {
         SSD1306_Buffer[i] = fill_val;
     }
 }
 
 /**
-  * @brief  Transfiere el buffer de la RAM del STM32 a la memoria física del chip SSD1306.
-  * @retval Ninguno.
-  */
+ * @brief  Envía los 1024 bytes del Framebuffer en RAM a la pantalla física.
+ * @note   La pantalla está dividida en 8 páginas horizontales de 8 píxeles de alto cada una.
+ */
 void ssd1306_UpdateScreen(void) {
-    /* La pantalla está dividida en 8 páginas horizontales de 8 píxeles de alto cada una */
-    for(uint8_t i = 0; i < 8; i++) {
-        ssd1306_WriteCommand(0xB0 + i); // Establece la dirección de la página (0xB0 a 0xB7)
-        ssd1306_WriteCommand(0x00);      // Resetea la columna inicio (Nibble bajo)
-        ssd1306_WriteCommand(0x10);      // Resetea la columna inicio (Nibble alto)
+    for (uint8_t page = 0; page < 8; page++) {
+        ssd1306_WriteCommand(0xB0 + page); // Fijar página actual (0 a 7)
+        ssd1306_WriteCommand(0x00);        // Resetear columna (parte baja)
+        ssd1306_WriteCommand(0x10);        // Resetear columna (parte alta)
 
-        /* 0x40 es el byte de control que indica transmisión de DATOS DE PÍXEL.
-         * Envía un bloque de 128 bytes correspondientes a la página actual. */
-        HAL_I2C_Mem_Write(&SSD1306_I2C_PORT, SSD1306_I2C_ADDR, 0x40, 1, &SSD1306_Buffer[128 * i], 128, 100);
+        /* El byte de control 0x40 indica que el bloque de 128 bytes son datos de vídeo */
+        HAL_I2C_Mem_Write(&SSD1306_I2C_PORT, SSD1306_I2C_ADDR, 0x40, 1,
+                          &SSD1306_Buffer[SSD1306_WIDTH * page], SSD1306_WIDTH, 100);
     }
 }
 
+/* ----------------------------------------------------------------------------
+ * PRIMITIVAS GRÁFICAS (DIBUJO 2D)
+ * ---------------------------------------------------------------------------- */
+
 /**
-  * @brief  Modifica un único píxel en las coordenadas (X,Y) dentro del buffer de RAM.
-  * @param  x: Posición horizontal (0 a 127).
-  * @param  y: Posición vertical (0 a 63).
-  * @param  color: Estado del píxel (White = Encendido, Black = Apagado).
-  * @retval Ninguno.
-  */
+ * @brief  Modifica un único píxel en las coordenadas (x, y) de la RAM.
+ */
 void ssd1306_DrawPixel(uint8_t x, uint8_t y, SSD1306_COLOR color) {
-    /* Verificación de límites para evitar corrupción de memoria */
-    if(x >= 128 || y >= 64) {
+    /* Protección contra desbordamiento de memoria */
+    if (x >= SSD1306_WIDTH || y >= SSD1306_HEIGHT) {
         return;
     }
 
-    /* Modifica el bit específico dentro del byte correspondiente en la matriz */
-    if(color == White) {
-        SSD1306_Buffer[x + (y / 8) * 128] |= (1 << (y % 8));  // Activa el bit (1) mediante OR
+    /* Cálculo de posición:
+     * (y / 8) * 128 + x : Ubica el byte exacto dentro del Framebuffer.
+     * (1 << (y % 8))    : Selecciona el bit vertical dentro de ese byte. */
+    if (color == White) {
+        SSD1306_Buffer[x + (y / 8) * SSD1306_WIDTH] |= (1 << (y % 8));
     } else {
-        SSD1306_Buffer[x + (y / 8) * 128] &= ~(1 << (y % 8)); // Desactiva el bit (0) mediante AND
+        SSD1306_Buffer[x + (y / 8) * SSD1306_WIDTH] &= ~(1 << (y % 8));
     }
 }
 
 /**
-  * @brief  Establece la coordenada actual donde se comenzará a escribir texto.
-  * @param  x: Coordenada X (0-127).
-  * @param  y: Coordenada Y (0-63).
-  * @retval Ninguno.
-  */
+ * @brief  Dibuja una línea recta entre dos puntos usando el Algoritmo de Bresenham.
+ */
+void ssd1306_DrawLine(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1, SSD1306_COLOR color) {
+    int16_t dx = (x0 < x1) ? (x1 - x0) : (x0 - x1);
+    int16_t dy = (y0 < y1) ? (y1 - y0) : (y0 - y1);
+    int16_t sx = (x0 < x1) ? 1 : -1;
+    int16_t sy = (y0 < y1) ? 1 : -1;
+    int16_t err = dx - dy;
+
+    while (1) {
+        ssd1306_DrawPixel(x0, y0, color);
+        if (x0 == x1 && y0 == y1) break;
+        int16_t e2 = 2 * err;
+        if (e2 > -dy) {
+            err -= dy;
+            x0 += sx;
+        }
+        if (e2 < dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+/**
+ * @brief  Dibuja el contorno de un rectángulo.
+ */
+void ssd1306_DrawRectangle(uint8_t x, uint8_t y, uint8_t w, uint8_t h, SSD1306_COLOR color) {
+    if (w == 0 || h == 0) return;
+    ssd1306_DrawLine(x, y, x + w - 1, y, color);
+    ssd1306_DrawLine(x, y + h - 1, x + w - 1, y + h - 1, color);
+    ssd1306_DrawLine(x, y, x, y + h - 1, color);
+    ssd1306_DrawLine(x + w - 1, y, x + w - 1, y + h - 1, color);
+}
+
+/**
+ * @brief  Dibuja un rectángulo sólido relleno.
+ */
+void ssd1306_DrawFilledRectangle(uint8_t x, uint8_t y, uint8_t w, uint8_t h, SSD1306_COLOR color) {
+    for (uint8_t i = 0; i < h; i++) {
+        ssd1306_DrawLine(x, y + i, x + w - 1, y + i, color);
+    }
+}
+
+/* ----------------------------------------------------------------------------
+ * FUNCIONES DE TEXTO
+ * ---------------------------------------------------------------------------- */
+
+/**
+ * @brief  Establece la coordenada actual donde se comenzará a escribir texto.
+ */
 void ssd1306_SetCursor(uint8_t x, uint8_t y) {
     SSD1306.CurrentX = x;
     SSD1306.CurrentY = y;
 }
 
 /**
-  * @brief  Dibuja un solo carácter en la posición actual del cursor.
-  * @param  ch: Carácter ASCII a dibujar (ej. 'A').
-  * @param  Font: Estructura con la fuente de texto a utilizar.
-  * @param  color: Color de las letras.
-  * @retval char: Carácter escrito o 0 si no cupo en la pantalla.
-  */
+ * @brief  Dibuja un carácter en la posición actual del cursor.
+ */
 char ssd1306_WriteChar(char ch, FontDef Font, SSD1306_COLOR color) {
-    uint32_t i, b, j;
-
-    /* Comprueba si el carácter cabe en los márgenes de la pantalla */
-    if (128 < (SSD1306.CurrentX + Font.FontWidth) ||
-        64 < (SSD1306.CurrentY + Font.FontHeight)) {
+    /* Comprobar si el carácter cabe en el panel */
+    if (SSD1306_WIDTH < (SSD1306.CurrentX + Font.FontWidth) ||
+        SSD1306_HEIGHT < (SSD1306.CurrentY + Font.FontHeight)) {
         return 0;
     }
 
-    /* Recorre la matriz de píxeles correspondiente a la fuente seleccionada */
-    for(i = 0; i < Font.FontHeight; i++) {
-        /* Resta 32 al valor ASCII ya que las tablas de fuentes inician en el espacio en blanco ' ' (ASCII 32) */
-        b = Font.data[(ch - 32) * Font.FontHeight + i];
+    /* Recorrer las filas y columnas del glifo de la tipografía */
+    for (uint32_t i = 0; i < Font.FontHeight; i++) {
+        /* Restar 32 porque la tabla ASCII imprimible arranca en el espacio ' ' (ASCII 32) */
+        uint16_t b = Font.data[(ch - 32) * Font.FontHeight + i];
 
-        for(j = 0; j < Font.FontWidth; j++) {
-            /* Evalúa bit a bit si el punto de la letra debe ir encendido o apagado */
-            if((b << j) & 0x8000) {
+        for (uint32_t j = 0; j < Font.FontWidth; j++) {
+            if ((b << j) & 0x8000) {
                 ssd1306_DrawPixel(SSD1306.CurrentX + j, SSD1306.CurrentY + i, color);
             } else {
                 ssd1306_DrawPixel(SSD1306.CurrentX + j, SSD1306.CurrentY + i, (SSD1306_COLOR)!color);
@@ -186,26 +219,20 @@ char ssd1306_WriteChar(char ch, FontDef Font, SSD1306_COLOR color) {
         }
     }
 
-    /* Desplaza el cursor X hacia la derecha para la siguiente letra */
+    /* Avanzar cursor a la siguiente columna */
     SSD1306.CurrentX += Font.FontWidth;
-
     return ch;
 }
 
 /**
-  * @brief  Escribe una cadena de caracteres completa.
-  * @param  str: Cadena de texto a escribir (cadena terminada en '\0').
-  * @param  Font: Estructura de la fuente tipográfica.
-  * @param  color: Color del texto.
-  * @retval char: Retorna el último carácter procesado.
-  */
+ * @brief  Escribe una cadena de caracteres completa.
+ */
 char ssd1306_WriteString(char* str, FontDef Font, SSD1306_COLOR color) {
-    /* Bucle hasta encontrar el carácter nulo '\0' que marca el final del string */
     while (*str) {
         if (ssd1306_WriteChar(*str, Font, color) != *str) {
-            return *str; // Retorna si ocurrió un error al escribir el carácter
+            return *str; // Fin si desborda la pantalla
         }
-        str++; // Avanza al siguiente carácter del puntero
+        str++;
     }
     return *str;
 }
