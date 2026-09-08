@@ -5,9 +5,12 @@
   * @brief          : Reproductor de audio WAV en tiempo real para STM32F446RE.
   *                   Pipeline: FatFs (SPI1) -> DMA Ping-Pong Buffer -> I2S2 -> DAC PCM5102A.
   * @author         : polcf03
+  * @note           : Implementa un buffer circular de doble mitad (Ping-Pong)
+  *                   sincronizado mediante interrupciones DMA (Half/Complete Transfer).
   ******************************************************************************
   */
 /* USER CODE END Header */
+
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "fatfs.h"
@@ -24,46 +27,47 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 /**
- * @brief Estados de la máquina de control de reproducción de audio.
+ * @brief Estados principales de la máquina de control de reproducción de audio.
  */
 typedef enum {
-    PLAYER_STOPPED = 0, /* Reproducción detenida, DMA inactiva */
-    PLAYER_PLAYING,     /* Audio en streaming continuo por DMA */
-    PLAYER_PAUSED       /* Reloj de audio pausado, archivo abierto */
+    PLAYER_STOPPED = 0, /*!< Reproducción detenida, DMA inactiva */
+    PLAYER_PLAYING,     /*!< Audio en streaming continuo vía DMA */
+    PLAYER_PAUSED       /*!< Reloj/transmisión de audio en pausa, archivo abierto */
 } PlayerState_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 /**
- * @brief Tamaño del búfer circular en muestras (uint16_t).
- *        4096 muestras = 2048 muestras estéreo (L+R).
- *        A 44.1 kHz, el búfer total representa ~46.4 ms de audio.
- *        Cada semibúfer (Ping-Pong) otorga un margen de ~23.2 ms a la CPU para leer de la SD.
+ * @brief Tamaño total del búfer circular en muestras de 16 bits (uint16_t).
+ * @details 4096 muestras equivalen a 2048 muestras por canal (L+R estéreo).
+ *          A 44.1 kHz, el búfer representa ~46.4 ms totales de audio.
+ *          Cada semibúfer (2048 palabras de 16 bits / 1024 muestras estéreo) otorga un
+ *          margen de ~23.2 ms a la CPU para leer de la tarjeta SD sin causar underrun.
  */
 #define AUDIO_BUFFER_SIZE   4096
 /* USER CODE END PD */
 
 /* Private variables ---------------------------------------------------------*/
-I2C_HandleTypeDef hi2c1;
-I2S_HandleTypeDef hi2s2;
-DMA_HandleTypeDef hdma_spi2_tx;
-SPI_HandleTypeDef hspi1;
+I2C_HandleTypeDef hi2c1;        /*!< Manejador del bus I2C1 (Pantalla OLED) */
+I2S_HandleTypeDef hi2s2;        /*!< Manejador de la interfaz de audio I2S2 (DAC PCM5102A) */
+DMA_HandleTypeDef hdma_spi2_tx; /*!< Manejador de DMA1 Stream 4 para TX I2S2 */
+SPI_HandleTypeDef hspi1;        /*!< Manejador del bus SPI1 (Lector SD) */
 
 /* USER CODE BEGIN PV */
 /* Objetos del Middleware FatFs */
-FATFS   FatFs;               /* Objeto de montaje del sistema de archivos en volumen lógico */
-FIL     audioFile;           /* Descriptor del archivo de audio actualmente abierto */
-FRESULT fr;                  /* Código de resultado de las operaciones FatFs */
-UINT    bytesRead;           /* Contador de bytes leídos en cada ráfaga de f_read */
+FATFS   FatFs;               /*!< Objeto de montaje del sistema de archivos en volumen lógico */
+FIL     audioFile;           /*!< Descriptor del archivo de audio actualmente abierto */
+FRESULT fr;                  /*!< Código de resultado de las operaciones FatFs */
+UINT    bytesRead;           /*!< Contador de bytes leídos en cada ráfaga de f_read */
 
 /* Variables de control del pipeline de audio */
-uint16_t audioBuffer[AUDIO_BUFFER_SIZE]; /* Búfer circular compartido entre CPU y DMA */
-volatile uint8_t bufferHalfFull = 0;    /* Flag de sincronización ISR-Main:
-                                            1 = Semibúfer 0 consumido (DMA transmite mitad 1)
-                                            2 = Semibúfer 1 consumido (DMA transmite mitad 0) */
-uint32_t audioDataOffset = 44;          /* Posición en bytes donde comienzan las muestras PCM */
-PlayerState_t playerState = PLAYER_STOPPED;
+uint16_t audioBuffer[AUDIO_BUFFER_SIZE]; /*!< Búfer circular compartido entre CPU y DMA */
+volatile uint8_t bufferHalfFull = 0;    /*!< Flag de sincronización ISR-Main:
+                                             1 = Semibúfer 0 consumido (DMA transmite mitad 1)
+                                             2 = Semibúfer 1 consumido (DMA transmite mitad 0) */
+uint32_t audioDataOffset = 44;          /*!< Posición en bytes donde comienzan las muestras PCM */
+PlayerState_t playerState = PLAYER_STOPPED; /*!< Estado actual del reproductor */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -85,9 +89,10 @@ uint32_t WAV_GetDataOffset(FIL* fp);
 
 /**
  * @brief  Localiza dinámicamente el inicio de los datos PCM (chunk "data") en un archivo WAV.
- * @note   Evita errores de alineación de 16 bits provocados por metadatos (etiquetas LIST/INFO).
+ * @details Examina la cabecera del archivo en búsqueda de la etiqueta ASCII "data".
+ *          Evita errores de alineación de 16 bits provocados por metadatos opcionales (etiquetas LIST/INFO).
  * @param  fp: Puntero al descriptor de archivo FatFs ya abierto.
- * @retval Desplazamiento en bytes desde el inicio del archivo donde inician las muestras PCM.
+ * @retval Desplazamiento en bytes (offset) desde el inicio del archivo donde inician las muestras PCM.
  */
 uint32_t WAV_GetDataOffset(FIL* fp) {
     uint8_t buffer[512];
@@ -95,35 +100,40 @@ uint32_t WAV_GetDataOffset(FIL* fp) {
 
     f_lseek(fp, 0);
     if (f_read(fp, buffer, sizeof(buffer), &br) != FR_OK || br < 44) {
-        return 44; /* Retorno seguro por defecto si el archivo es un WAV canónico */
+        return 44; /* Retorno seguro por defecto si el archivo es un WAV canónico de 44 bytes */
     }
 
-    /* Búsqueda de la firma "data" en los primeros 512 bytes de cabecera */
+    /* Búsqueda de la firma "data" en los primeros 512 bytes de la cabecera */
     for (uint32_t i = 0; i < br - 4; i++) {
         if (buffer[i] == 'd' && buffer[i+1] == 'a' &&
             buffer[i+2] == 't' && buffer[i+3] == 'a') {
-            return i + 8; /* Saltar el identificador de 4 bytes + campo ChunkSize de 4 bytes */
+            return i + 8; /* Saltar el identificador "data" (4 bytes) + campo ChunkSize (4 bytes) */
         }
     }
     return 44;
 }
 
 /**
- * @brief  Renderiza la interfaz de usuario en el display OLED SSD1306 vía I2C.
- * @param  songName: Cadena de texto con el nombre de la pista a mostrar.
- * @retval Ninguno.
+ * @brief  Renderiza la interfaz visual del reproductor en la pantalla OLED SSD1306 vía I2C.
+ * @param  songName: Cadena de caracteres con el título del tema a mostrar.
+ * @retval Ninguno
  */
 void Draw_PlayerScreen(const char* songName) {
     ssd1306_Fill(Black);
+
+    /* Encabezado */
     ssd1306_SetCursor(0, 0);
     ssd1306_WriteString("STM32 PLAYER", Font_7x10, White);
 
+    /* Nombre del tema */
     ssd1306_SetCursor(0, 18);
     ssd1306_WriteString((char*)songName, Font_7x10, White);
 
+    /* Estado del reproductor */
     ssd1306_SetCursor(0, 34);
     ssd1306_WriteString("Status: PLAY", Font_7x10, White);
 
+    /* Indicador de progreso estático */
     ssd1306_SetCursor(0, 50);
     ssd1306_WriteString("[=====>    ]", Font_7x10, White);
 
@@ -131,9 +141,9 @@ void Draw_PlayerScreen(const char* songName) {
 }
 
 /**
- * @brief  Detiene la ejecución y muestra el mensaje de fallo en la pantalla OLED.
- * @param  msg: Descripción breve del error ocurrido.
- * @retval Ninguno (bucle infinito).
+ * @brief  Detiene la ejecución del sistema y muestra un mensaje de fallo crítico en la pantalla.
+ * @param  msg: Cadena de texto descriptiva del error detectado.
+ * @retval Ninguno (Entra en un bucle de bloqueo permanente).
  */
 void Display_Error(const char* msg) {
     ssd1306_Fill(Black);
@@ -147,12 +157,19 @@ void Display_Error(const char* msg) {
 
 /* USER CODE END 0 */
 
+/**
+  * @brief  Punto de entrada principal de la aplicación.
+  * @retval int
+  */
 int main(void)
 {
+  /* Reset de todos los periféricos, inicialización de la interfaz Flash y SysTick */
   HAL_Init();
+
+  /* Configuración del reloj del sistema (System Clock) */
   SystemClock_Config();
 
-  /* Inicialización de controladores periféricos */
+  /* Inicialización de periféricos generados por STM32CubeMX */
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_I2C1_Init();
@@ -161,28 +178,29 @@ int main(void)
   MX_SPI1_Init();
 
   /* USER CODE BEGIN 2 */
-  /* 1. Inicialización de periféricos y estado del bus */
+
+  /* 1. Inicialización de la pantalla OLED y preparación del bus SPI de la SD */
   ssd1306_Init();
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET); /* Deseleccionar SD (CS en HIGH) */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET); /* Deseleccionar Chip Select (CS) de la SD (HIGH) */
   HAL_Delay(50);
 
-  /* 2. Montaje del sistema de archivos en baja velocidad (<400 kHz exigido por protocolo SD) */
+  /* 2. Montaje del sistema de archivos FatFs a baja velocidad (<400 kHz requerido para inicializar la tarjeta SD) */
   fr = f_mount(&FatFs, "", 1);
   if (fr != FR_OK) {
       Display_Error("SD MOUNT FAIL");
   }
 
-  /* 3. Transición a alta velocidad (10.5 MHz) para garantizar ancho de banda de audio */
+  /* 3. Reconfiguración de velocidad del bus SPI a alta velocidad (10.5 MHz) para transferencia de audio */
   hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
   HAL_SPI_Init(&hspi1);
 
-  /* 4. Apertura del archivo de audio */
+  /* 4. Apertura del archivo WAV desde la SD */
   fr = f_open(&audioFile, "test.wav", FA_READ);
   if (fr != FR_OK) {
       Display_Error("FILE NOT FOUND");
   }
 
-  /* 5. Análisis de cabecera y precarga del primer bloque completo */
+  /* 5. Análisis de cabecera para ignorar metadatos y precarga del búfer Ping-Pong completo */
   audioDataOffset = WAV_GetDataOffset(&audioFile);
   f_lseek(&audioFile, audioDataOffset);
 
@@ -191,8 +209,8 @@ int main(void)
       Display_Error("FILE READ ERR");
   }
 
-  /* 6. Inicialización visual e inicio de la transmisión DMA en modo Circular */
-  Draw_PlayerScreen("test.wav");
+  /* 6. Actualización de la pantalla e inicio del streaming I2S con DMA en modo circular */
+  Draw_PlayerScreen("Your Lie In April!!");
   playerState = PLAYER_PLAYING;
   HAL_I2S_Transmit_DMA(&hi2s2, (uint16_t*)audioBuffer, AUDIO_BUFFER_SIZE);
 
@@ -203,27 +221,30 @@ int main(void)
   while (1)
   {
       /**
-       * Arquitectura Ping-Pong Buffering:
-       * Cuando la DMA termina la primera mitad del búfer, la CPU lee el siguiente
-       * bloque de la SD y lo escribe en la mitad 0 mientras la DMA transmite la mitad 1.
+       * MANTENIMIENTO DEL BÚFER CIRCULAR PING-PONG:
+       *
+       * Evento 1: La DMA ha completado el envío de la primera mitad del búfer (Muestras 0 a 2047).
+       * Acción CPU: Recarga la primera mitad con datos nuevos desde la SD mientras la DMA
+       *             sigue transmitiendo la segunda mitad de forma ininterrumpida.
        */
       if (bufferHalfFull == 1) {
           bufferHalfFull = 0;
           fr = f_read(&audioFile, &audioBuffer[0], sizeof(audioBuffer) / 2, &bytesRead);
           if (bytesRead < (sizeof(audioBuffer) / 2) || fr != FR_OK) {
-              f_lseek(&audioFile, audioDataOffset); /* Rebobinar al inicio si alcanza el EOF */
+              f_lseek(&audioFile, audioDataOffset); /* Rebobinar al inicio del audio si alcanza el EOF */
           }
       }
 
       /**
-       * Cuando la DMA termina la segunda mitad del búfer, la CPU recarga
-       * la mitad 1 mientras la DMA transmite la mitad 0.
+       * Evento 2: La DMA ha completado el envío de la segunda mitad del búfer (Muestras 2048 a 4095).
+       * Acción CPU: Recarga la segunda mitad con datos nuevos desde la SD mientras la DMA
+       *             vuelve a transmitir la primera mitad en bucle.
        */
       if (bufferHalfFull == 2) {
           bufferHalfFull = 0;
           fr = f_read(&audioFile, &audioBuffer[AUDIO_BUFFER_SIZE / 2], sizeof(audioBuffer) / 2, &bytesRead);
           if (bytesRead < (sizeof(audioBuffer) / 2) || fr != FR_OK) {
-              f_lseek(&audioFile, audioDataOffset); /* Rebobinar al inicio si alcanza el EOF */
+              f_lseek(&audioFile, audioDataOffset); /* Rebobinar al inicio del audio si alcanza el EOF */
           }
       }
   }
@@ -234,7 +255,7 @@ int main(void)
 }
 
 /**
-  * @brief System Clock Configuration
+  * @brief Configuración del sistema de relojes (System Clock).
   * @retval None
   */
 void SystemClock_Config(void)
@@ -274,8 +295,7 @@ void SystemClock_Config(void)
 }
 
 /**
-  * @brief I2C1 Initialization Function
-  * @param None
+  * @brief Inicialización del periférico I2C1 (Pantalla OLED).
   * @retval None
   */
 static void MX_I2C1_Init(void)
@@ -296,8 +316,7 @@ static void MX_I2C1_Init(void)
 }
 
 /**
-  * @brief I2S2 Initialization Function
-  * @param None
+  * @brief Inicialización del periférico I2S2 (Interfaz de Audio).
   * @retval None
   */
 static void MX_I2S2_Init(void)
@@ -319,8 +338,7 @@ static void MX_I2S2_Init(void)
 }
 
 /**
-  * @brief SPI1 Initialization Function
-  * @param None
+  * @brief Inicialización del periférico SPI1 (Comunicación con SD).
   * @retval None
   */
 static void MX_SPI1_Init(void)
@@ -344,7 +362,8 @@ static void MX_SPI1_Init(void)
 }
 
 /**
-  * @brief DMA Initialization Function
+  * @brief Inicialización de la controladora DMA para I2S2.
+  * @retval None
   */
 static void MX_DMA_Init(void)
 {
@@ -354,34 +373,35 @@ static void MX_DMA_Init(void)
 }
 
 /**
-  * @brief GPIO Initialization Function
+  * @brief Inicialización general de los pines GPIO.
+  * @retval None
   */
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
 
-  /* GPIO Ports Clock Enable */
+  /* Habilitación de relojes de los puertos GPIO */
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
-  /* Configure GPIO pin Output Level */
+  /* Nivel lógico inicial del pin de selección SD (CS) */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
 
-  /* Configure GPIO pin : B1_Pin */
+  /* Configuración de pin: Botón azul B1 (PC13) */
   GPIO_InitStruct.Pin = B1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /* Configure GPIO pins : BTN_NEXT_Pin BTN_PREV_Pin */
+  /* Configuración de pines: Botones de control NEXT (PA0) y PREV (PA1) */
   GPIO_InitStruct.Pin = BTN_NEXT_Pin|BTN_PREV_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /* Configure GPIO pins : USART_TX_Pin USART_RX_Pin */
+  /* Configuración de pines: UART2 TX/RX (PA2 / PA3) */
   GPIO_InitStruct.Pin = USART_TX_Pin|USART_RX_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -389,7 +409,7 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF7_USART2;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /* Configure GPIO pin : PB6 (CS de la SD) */
+  /* Configuración del pin: Chip Select (CS) para tarjeta SD (PB6) */
   GPIO_InitStruct.Pin = GPIO_PIN_6;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -398,29 +418,35 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
 /**
- * @brief  Callback de transferencia media de la DMA I2S.
- *         Se dispara cuando la DMA ha enviado la primera mitad del búfer.
+ * @brief  Callback de interrupción por transferencia a mitad de búfer DMA I2S (Half Transfer).
+ * @details Invocado por HAL cuando la DMA transmite el primer bloque `[0 ... (AUDIO_BUFFER_SIZE/2) - 1]`.
+ * @param  hi2s: Puntero a la estructura de configuración I2S.
+ * @retval None
  */
 void HAL_I2S_TxHalfCpltCallback(I2S_HandleTypeDef *hi2s) {
     if (hi2s->Instance == SPI2) {
-        bufferHalfFull = 1;
+        bufferHalfFull = 1; /* Señaliza al bucle principal para recargar la mitad 0 */
     }
 }
 
 /**
- * @brief  Callback de transferencia completa de la DMA I2S.
- *         Se dispara cuando la DMA ha enviado la segunda mitad del búfer.
+ * @brief  Callback de interrupción por transferencia completa de búfer DMA I2S (Transfer Complete).
+ * @details Invocado por HAL cuando la DMA transmite el segundo bloque `[(AUDIO_BUFFER_SIZE/2) ... AUDIO_BUFFER_SIZE - 1]`.
+ * @param  hi2s: Puntero a la estructura de configuración I2S.
+ * @retval None
  */
 void HAL_I2S_TxCpltCallback(I2S_HandleTypeDef *hi2s) {
     if (hi2s->Instance == SPI2) {
-        bufferHalfFull = 2;
+        bufferHalfFull = 2; /* Señaliza al bucle principal para recargar la mitad 1 */
     }
 }
+
 /* USER CODE END 4 */
 
 /**
-  * @brief  This function is executed in case of error occurrence.
+  * @brief  Manejador global de errores irrecuperables.
   * @retval None
   */
 void Error_Handler(void)
